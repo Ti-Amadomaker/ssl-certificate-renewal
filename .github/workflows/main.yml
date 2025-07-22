@@ -1,0 +1,304 @@
+name: SSL Certificate Renewal
+
+on:
+  schedule:
+    - cron: '0 2 1 */2 *' # Run every 2 months on the 1st at 2 AM
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  DOMAIN: amadoplay.amadomaker.com.br
+  WWW_DOMAIN: www.amadoplay.amadomaker.com.br
+  GCP_SA_KEY: ${{ secrets.GOOGLE_PROJECT_SA_KEY }}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_DNS_ZONE: ${{ secrets.GCP_DNS_ZONE }}
+  LB_NAME: ${{ secrets.LB_NAME }}
+  CERT_EMAIL: ${{ secrets.CERT_EMAIL }}
+
+jobs:
+  renew-ssl-certificate:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ env.GCP_SA_KEY }}
+        project_id: ${{ env.GCP_PROJECT_ID }}
+
+    - name: Install certbot
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y certbot
+
+    - name: Start Certbot DNS Challenge
+      id: dns_challenge
+      run: |
+        # Create expect script to handle certbot interaction
+        cat > certbot_dns.exp << 'EOF'
+        #!/usr/bin/expect
+        
+        set timeout 300
+        set domain1 [lindex $argv 0]
+        set domain2 [lindex $argv 1]
+        
+        # Start certbot
+        spawn sudo certbot certonly --manual --preferred-challenges dns -d $domain1 -d $domain2 --agree-tos --email $env(CERT_EMAIL) --no-eff-email
+        
+        # Initialize variables
+        set dns_names {}
+        set dns_values {}
+        set challenge_count 0
+        
+        expect {
+            -re "_acme-challenge\.([^.]+\.[^.]+\.[^.]+\.[^.]+)\." {
+                set dns_name "_acme-challenge.$expect_out(1,string)"
+                lappend dns_names $dns_name
+                puts "DNS_NAME_$challenge_count=$dns_name"
+                exp_continue
+            }
+            -re "with the following value:\r?\n([A-Za-z0-9_-]{43})" {
+                set dns_value $expect_out(1,string)
+                lappend dns_values $dns_value
+                puts "DNS_VALUE_$challenge_count=$dns_value"
+                incr challenge_count
+                exp_continue
+            }
+            "Press Enter to Continue" {
+                puts "CHALLENGE_COUNT=$challenge_count"
+                puts "READY_FOR_DNS=true"
+                # Don't continue yet, wait for DNS setup
+                exit 0
+            }
+            timeout {
+                puts "Timeout waiting for DNS challenge"
+                exit 1
+            }
+        }
+        EOF
+        
+        chmod +x certbot_dns.exp
+        
+        # Run the expect script and capture output
+        output=$(CERT_EMAIL="${{ secrets.CERT_EMAIL }}" ./certbot_dns.exp "${{ env.DOMAIN }}" "${{ env.WWW_DOMAIN }}")
+        echo "$output"
+        
+        # Parse output and set GitHub outputs
+        echo "$output" | while IFS= read -r line; do
+          if [[ $line == DNS_NAME_* ]]; then
+            echo "${line}" >> $GITHUB_OUTPUT
+          elif [[ $line == DNS_VALUE_* ]]; then
+            echo "${line}" >> $GITHUB_OUTPUT
+          elif [[ $line == CHALLENGE_COUNT=* ]]; then
+            echo "${line}" >> $GITHUB_OUTPUT
+          elif [[ $line == READY_FOR_DNS=* ]]; then
+            echo "${line}" >> $GITHUB_OUTPUT
+          fi
+        done
+
+    - name: Create DNS TXT Records in GCP
+      if: steps.dns_challenge.outputs.READY_FOR_DNS == 'true'
+      run: |
+        challenge_count=${{ steps.dns_challenge.outputs.CHALLENGE_COUNT }}
+        
+        for ((i=0; i<challenge_count; i++)); do
+          dns_name_var="DNS_NAME_$i"
+          dns_value_var="DNS_VALUE_$i"
+          
+          dns_name="${{ steps.dns_challenge.outputs }}[dns_name_var]"
+          dns_value="${{ steps.dns_challenge.outputs}} [dns_value_var]"
+          
+          if [[ -n "$dns_name" && -n "$dns_value" ]]; then
+            echo "Creating DNS record: $dns_name = $dns_value"
+            
+            # Check if record exists and delete it
+            if gcloud dns record-sets list --zone="${{ env.GCP_DNS_ZONE }}" --name="${dns_name}." --type="TXT" --format="value(name)" | grep -q "${dns_name}."; then
+              echo "Deleting existing DNS record..."
+              old_value=$(gcloud dns record-sets list --zone="${{ env.GCP_DNS_ZONE }}" --name="${dns_name}." --type="TXT" --format="value(rrdatas[0])")
+              gcloud dns record-sets transaction start --zone="${{ env.GCP_DNS_ZONE }}"
+              gcloud dns record-sets transaction remove --zone="${{ env.GCP_DNS_ZONE }}" --name="${dns_name}." --type="TXT" --ttl=60 "$old_value"
+              gcloud dns record-sets transaction add --zone="${{ env.GCP_DNS_ZONE }}" --name="${dns_name}." --type="TXT" --ttl=60 "\"$dns_value\""
+              gcloud dns record-sets transaction execute --zone="${{ env.GCP_DNS_ZONE }}"
+            else
+              # Create new record
+              gcloud dns record-sets create "${dns_name}." --zone="${{ env.GCP_DNS_ZONE }}" --type="TXT" --ttl=60 --rrdatas="\"$dns_value\""
+            fi
+          fi
+        done
+
+    - name: Wait for DNS propagation
+      run: |
+        echo "Waiting for DNS propagation..."
+                sleep 120 # Wait 2 minutes for DNS propagation
+        
+        # Verify DNS propagation
+        challenge_count=${{ steps.dns_challenge.outputs.CHALLENGE_COUNT }}
+        
+        for ((i=0; i<challenge_count; i++)); do
+          dns_name_var="DNS_NAME_$i"
+          dns_value_var="DNS_VALUE_$i"
+          
+          dns_name=$(echo "${{ steps.dns_challenge.outputs }}" | grep -oP "(?<=${dns_name_var}=).*")
+          dns_value=$(echo "${{ steps.dns_challenge.outputs }}" | grep -oP "(?<=${dns_value_var}=).*")
+          
+          if [[ -n "$dns_name" && -n "$dns_value" ]]; then
+            echo "Verifying DNS record: $dns_name"
+            
+            max_attempts=30
+            attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+              if dig +short TXT "$dns_name" | grep -q "$dns_value"; then
+                echo "DNS record verified: $dns_name"
+                break
+              else
+                echo "Attempt $attempt: DNS not yet propagated, waiting..."
+                sleep 10
+                ((attempt++))
+              fi
+            done
+            
+            if [ $attempt -gt $max_attempts ]; then
+              echo "Warning: DNS propagation verification failed for $dns_name"
+            fi
+          fi
+        done
+
+    - name: Complete Certbot Challenge
+      run: |
+        # Create expect script to complete the challenge
+        cat > complete_certbot.exp << 'EOF'
+        #!/usr/bin/expect
+        
+        set timeout 300
+        set domain1 [lindex $argv 0]
+        set domain2 [lindex $argv 1]
+        
+        # Resume certbot process
+        spawn sudo certbot certonly --manual --preferred-challenges dns -d $domain1 -d $domain2 --agree-tos --email $env(CERT_EMAIL) --no-eff-email
+        
+        expect {
+            "Press Enter to Continue" {
+                send "\r"
+                exp_continue
+            }
+            -re "Successfully received certificate|Certificate is saved at" {
+                puts "Certificate generated successfully"
+                expect eof
+            }
+            -re "Congratulations!" {
+                puts "Certificate renewal completed"
+                expect eof
+            }
+            timeout {
+                puts "Timeout during certificate generation"
+                exit 1
+            }
+            eof
+        }
+        EOF
+        
+        chmod +x complete_certbot.exp
+        CERT_EMAIL="${{ secrets.CERT_EMAIL }}" ./complete_certbot.exp "${{ env.DOMAIN }}" "${{ env.WWW_DOMAIN }}"
+
+    - name: Extract Certificate Files
+      id: cert_files
+      run: |
+        cert_path="/etc/letsencrypt/live/${{ env.DOMAIN }}"
+        
+        if [[ -f "$cert_path/fullchain.pem" && -f "$cert_path/privkey.pem" ]]; then
+          # Encode certificates to base64 for secure handling
+          cert_content=$(sudo cat "$cert_path/fullchain.pem" | base64 -w 0)
+          key_content=$(sudo cat "$cert_path/privkey.pem" | base64 -w 0)
+          
+          echo "cert_content=$cert_content" >> $GITHUB_OUTPUT
+          echo "key_content=$key_content" >> $GITHUB_OUTPUT
+          echo "cert_ready=true" >> $GITHUB_OUTPUT
+        else
+          echo "Certificate files not found"
+          echo "cert_ready=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Update GCP Load Balancer Certificate
+      if: steps.cert_files.outputs.cert_ready == 'true'
+      run: |
+        # Create temporary certificate files
+        echo "${{ steps.cert_files.outputs.cert_content }}" | base64 -d > /tmp/fullchain.pem
+        echo "${{ steps.cert_files.outputs.key_content }}" | base64 -d > /tmp/privkey.pem
+        
+        # Generate certificate name with timestamp
+        cert_name="${{ env.DOMAIN }}-$(date +%Y%m%d-%H%M%S)"
+        cert_name=$(echo "$cert_name" | sed 's/\./-/g')
+        
+        # Create new SSL certificate in GCP
+        gcloud compute ssl-certificates create "$cert_name" \
+          --certificate=/tmp/fullchain.pem \
+          --private-key=/tmp/privkey.pem \
+          --global
+        
+        # Wait for certificate to be ready
+        echo "Waiting for certificate to be provisioned..."
+        sleep 30
+        
+        # Get current target HTTPS proxy
+        proxy_name=$(gcloud compute target-https-proxies list --filter="name~${{ env.LB_NAME }}" --format="value(name)" | head -n1)
+        
+        if [[ -n "$proxy_name" ]]; then
+          # Update target HTTPS proxy with new certificate
+          gcloud compute target-https-proxies update "$proxy_name" \
+            --ssl-certificates="$cert_name" \
+            --global
+          
+          echo "Updated HTTPS proxy: $proxy_name with certificate: $cert_name"
+          
+          # Clean up old certificates (keep last 3)
+          echo "Cleaning up old certificates..."
+          old_certs=$(gcloud compute ssl-certificates list --filter="name~${{ env.DOMAIN }}" --sort-by="creationTimestamp" --format="value(name)" | head -n -3)
+          
+          for cert in $old_certs; do
+            echo "Deleting old certificate: $cert"
+            gcloud compute ssl-certificates delete "$cert" --global --quiet || true
+          done
+        else
+          echo "Target HTTPS proxy not found for load balancer: ${{ env.LB_NAME }}"
+          exit 1
+        fi
+        
+        # Clean up temporary files
+        rm -f /tmp/fullchain.pem /tmp/privkey.pem
+
+    - name: Cleanup DNS Records
+      if: always()
+      run: |
+        echo "Cleaning up temporary DNS records..."
+        challenge_count=${{ steps.dns_challenge.outputs.CHALLENGE_COUNT || '0' }}
+        dns_outputs=${{ steps.dns_challenge.outputs }}
+        
+        for ((i=0; i<challenge_count; i++)); do
+          dns_name_var="DNS_NAME_$i"
+          dns_name=$(echo "$dns_outputs" | grep -oP "(?<=${dns_name_var}=).*")
+          
+          if [[ -n "$dns_name" ]]; then
+            echo "Removing DNS record: $dns_name"
+            
+            if gcloud dns record-sets list --zone="${{ env.GCP_DNS_ZONE }}" --name="${dns_name}." --type="TXT" --format="value(name)" | grep -q "${dns_name}."; then
+              dns_value=$(gcloud dns record-sets list --zone="${{ env.GCP_DNS_ZONE }}" --name="${dns_name}." --type="TXT" --format="value(rrdatas[0])")
+              gcloud dns record-sets delete "${dns_name}." --zone="${{ env.GCP_DNS_ZONE }}" --type="TXT" --quiet || true
+            fi
+          fi
+        done
+
+    - name: Notification
+      if: always()
+      run: |
+        if [[ "${{ job.status }}" == "success" ]]; then
+          echo "✅ SSL certificate renewal completed successfully!"
+          echo "Domain: ${{ env.DOMAIN }}"
+          echo "Load Balancer: ${{ env.LB_NAME }}"
+        else
+          echo "❌ SSL certificate renewal failed!"
+          echo "Check the logs for details."
+        fi
